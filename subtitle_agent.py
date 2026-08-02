@@ -268,10 +268,17 @@ class LlamaCppClient:
             "stream": False,
         }
         if self.disable_thinking:
+            # Current llama.cpp uses reasoning_effort=none as the per-request
+            # switch. Keep enable_thinking=false for older builds. Do not use
+            # reasoning_format=none here: it controls parsing, not reliably
+            # whether Qwen3.x enters a thinking block.
             base_payload["chat_template_kwargs"] = {"enable_thinking": False}
-            base_payload["reasoning_format"] = "none"
+            base_payload["reasoning_effort"] = "none"
 
-        formats = [
+        # Prefer schema-constrained JSON. If llama.cpp cannot initialize the
+        # generated grammar, retry with generic JSON and finally with no grammar.
+        # Python validation below still requires every expected cue ID exactly once.
+        formats: list[dict[str, Any] | None] = [
             {
                 "type": "json_schema",
                 "json_schema": {
@@ -280,14 +287,15 @@ class LlamaCppClient:
                     "schema": schema,
                 },
             },
-            {"type": "json_object", "schema": schema},
             {"type": "json_object"},
+            None,
         ]
         last_error: Exception | None = None
         for attempt in range(self.retries):
             response_format = formats[min(attempt, len(formats) - 1)]
             payload = dict(base_payload)
-            payload["response_format"] = response_format
+            if response_format is not None:
+                payload["response_format"] = response_format
             if attempt:
                 payload["messages"] = [
                     payload["messages"][0],
@@ -884,8 +892,9 @@ def items_schema(ids: Sequence[int]) -> dict[str, Any]:
         "properties": {
             "items": {
                 "type": "array",
-                "minItems": len(ids),
-                "maxItems": len(ids),
+                # Avoid encoding the exact batch length as a large GBNF
+                # repetition such as {47,47}. parse_items() enforces the exact
+                # expected ID set after generation.
                 "items": {
                     "type": "object",
                     "properties": {

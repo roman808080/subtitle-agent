@@ -249,3 +249,15 @@ The cache key includes prompts, model, schema, and generation settings. Re-runni
 - URL parsing is static; no browser engine or JavaScript runtime is used.
 - The model’s JSON is schema-constrained where supported and validated again by Python.
 - Human review remains recommended for reading speed, line breaks, names, and timing.
+
+## llama.cpp grammar-sampler compatibility
+
+If llama.cpp logs `error initializing grammar sampler` and shows an exact repetition such as `{47,47}`, use this version of the agent. It avoids putting the exact batch length into the JSON grammar and validates the complete cue-ID set in Python instead.
+
+For Qwen3.6, start a recent llama-server with reasoning disabled when possible:
+
+```bash
+llama-server -m Qwen3.6-27B-Q8_0.gguf -c 262144 --reasoning off --port 8080
+```
+
+The client also sends `reasoning_effort: "none"` and retains the older `enable_thinking: false` hint for compatibility. If schema-constrained JSON still fails, the agent automatically retries with generic JSON, then unconstrained output, while preserving Python-side structural validation. Keep `--retries 3` or higher for this fallback chain.
