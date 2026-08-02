@@ -1,68 +1,156 @@
-# Local Multilingual Subtitle Correction and Translation Agent
+# Local Multilingual Subtitle Agent — v5
 
-`subtitle_agent.py` corrects an SRT transcript in its source language and produces English and/or Russian subtitles through a local OpenAI-compatible `llama.cpp` server.
+`subtitle_agent.py` corrects source-language SRT subtitles and produces English and/or Russian output through a local OpenAI-compatible `llama.cpp` server.
+
+## Languages
 
 Supported source languages:
 
-- `en` — English
-- `ru` — Russian
-- `he` — Hebrew
-- `cs` — Czech
-- `es` — Spanish
-- `pt` — Portuguese
+- English: `en`
+- Russian: `ru`
+- Hebrew: `he`
+- Czech: `cs`
+- Spanish: `es`
+- Portuguese: `pt`
 
-Supported output languages:
+Supported targets are English and Russian. The default is:
 
-- `en` — English
-- `ru` — Russian
+```bash
+--targets en,ru
+```
 
-The default is `--targets en,ru`.
+## Safety model
 
-## Agentic workflow
+The model can propose subtitle text only. Python owns and preserves:
 
-For source correction, the program runs:
+- cue count;
+- original cue numbers;
+- timestamps;
+- cue order;
+- input and reference files;
+- output paths.
 
-1. **Editor** — corrects transcription, spelling, punctuation, names, and terminology.
-2. **Critic** — compares the correction with the original cues, neighboring context, and any reference transcript.
-3. **Reviser** — applies actionable critic findings.
-4. **Deterministic validator** — verifies cue coverage and output structure.
+The model receives no shell or filesystem tools. Audio/video is never required. When `--audio` is supplied, it is read only to calculate and recheck its SHA-256, size, and modification timestamp.
 
-The editor–critic–reviser loop then runs independently for each requested translation.
+For a stronger operating-system guarantee, run the agent as a user without write access to the media/input directory or mount it read-only.
 
-Original cue numbers and timestamps never enter an editable model field. The model receives private consecutive IDs only for matching returned text. It can return only `{id, text}` records, and the host rejects missing, duplicated, or unexpected IDs.
+## Production-hardening in v5
 
-## Audio and video safety
+### Fail-closed output policy
 
-Audio/video is optional and is **not processed**. When `--audio` is supplied, the script:
+The default is:
 
-- opens the file only in binary read mode to calculate SHA-256;
-- never sends audio or video bytes to the model;
-- never invokes FFmpeg or a shell;
-- never writes to, renames, converts, or deletes the media file;
-- rejects any generated path that equals a protected input path;
-- verifies size, modification time, and SHA-256 again after processing.
+```bash
+--output-policy strict
+```
 
-The model receives no filesystem or shell tools.
+Strict mode uses schema-constrained JSON only. It never silently downgrades to generic JSON or unconstrained text.
 
-For an operating-system-level guarantee, run the agent as a user without write permission to the media directory or expose that directory through a read-only mount.
+When a failure is likely related to output size or structure, the agent automatically splits only the affected batch and retries the same strict stage. Splittable failures are:
+
+- grammar initialization;
+- request/context size;
+- truncated generation;
+- malformed JSON;
+- stage validation failure.
+
+Network, authentication, and server-availability errors are retried normally and are never treated as reasons to split a batch or weaken constraints.
+
+The smallest automatic batch is controlled by:
+
+```bash
+--min-batch-size 4
+```
+
+### Optional adaptive policy
+
+For compatibility with a server that cannot reliably use constrained JSON:
+
+```bash
+--output-policy adaptive
+```
+
+Adaptive mode first performs the same strict batch splitting. Only after a failing batch reaches `--min-batch-size` may it try:
+
+1. generic JSON-object mode;
+2. unconstrained text followed by JSON extraction and strict Python validation.
+
+This mode is less desirable for unattended processing. Strict remains the default.
+
+### Validated-only caching
+
+A response enters `.subtitle_agent_cache.json` only after it passes its stage-specific validator.
+
+On a cache hit, the response is validated again. An old or invalid cache entry is evicted and regenerated. Strict and adaptive runs use different cache identities, so strict mode cannot reuse a response produced through a weak fallback.
+
+### Strict critic validation
+
+Critic output is no longer silently filtered. Every issue must have exactly:
+
+```json
+{
+  "id": 123,
+  "severity": "error",
+  "problem": "One-line explanation",
+  "suggested_text": "Complete replacement text"
+}
+```
+
+Unexpected IDs, duplicate IDs, invalid severities, missing fields, extra fields, and empty suggestions fail validation and trigger retry/splitting. A malformed critic response can no longer be interpreted as “no issues.”
+
+### Diagnostics and audit trail
+
+Failed model responses are preserved by default under:
+
+```text
+OUTPUT_DIR/diagnostics/RUN_ID/
+```
+
+Each diagnostic records:
+
+- stage;
+- response mode;
+- attempt number;
+- classified error;
+- raw model content, when available.
+
+Disable this when transcript content must not be retained:
+
+```bash
+--no-diagnostics
+```
+
+Successful audits include every model attempt, response mode, retry, fallback, parser repair, cache hit/eviction, and batch split.
+
+An aborted run writes a unique failure audit such as:
+
+```text
+episode.20260802T181500.123456Z.failure.audit.json
+```
+
+### Optional separate critic model
+
+By default, editor, critic, and reviser use the same model. This is self-review, not independent verification.
+
+A second model served by the same llama.cpp endpoint can be selected for critic stages:
+
+```bash
+--critic-model another-model-alias
+```
 
 ## Requirements
 
-- Python 3.11 or newer recommended.
-- A running `llama.cpp` server exposing `/v1/chat/completions` and `/v1/models`.
-- Optional: `pypdf` for local or remote PDF references.
-
-The core agent otherwise uses only Python’s standard library.
+- Python 3.11 or newer recommended;
+- a running `llama.cpp` OpenAI-compatible server exposing `/v1/models` and `/v1/chat/completions`;
+- optional `pypdf` for PDF reference documents.
 
 Install optional PDF support:
 
 ```bash
-python -m pip install pypdf
+python -m pip install -r requirements_subtitle_agent.txt
 ```
 
-## Start the model server
-
-Example on the inference machine:
+## Server example
 
 ```bash
 llama-server \
@@ -71,193 +159,133 @@ llama-server \
   --host 0.0.0.0 \
   --port 8080 \
   -c 262144 \
+  --reasoning off \
   --jinja
 ```
 
-Restrict the port to the trusted LAN with the inference machine’s firewall.
+Restrict the listening port to the trusted LAN.
 
-## Basic examples
+The client also sends `reasoning_effort: "none"` and `enable_thinking: false` unless `--keep-thinking` is used.
 
-### Hebrew source to corrected Hebrew, English, and Russian
+## Basic command
+
+```bash
+python subtitle_agent.py episode.srt \
+  --source-lang es \
+  --targets en,ru \
+  --base-url http://192.168.1.50:8080/v1 \
+  --model qwen3.6-27b \
+  --output-policy strict \
+  --batch-size 48 \
+  --min-batch-size 4
+```
+
+## Reference transcript inputs
+
+References are optional and may be mixed or repeated.
+
+### General URL
+
+```bash
+--reference-url 'https://example.org/transcript'
+```
+
+The reader follows normal redirects, parses static HTML, and accepts direct TXT, PDF, and DOCX responses. It reads only the provided URL, does not crawl links, and does not execute JavaScript.
+
+### Local file
+
+```bash
+--reference-file transcript.txt
+--reference-file saved_page.html
+```
+
+Supported local formats include TXT, HTML, HTM, Markdown, DOCX, and PDF. The flexible `--reference` option accepts either a path or an HTTP(S) URL.
+
+## Common examples
+
+Hebrew to English and Russian:
 
 ```bash
 python subtitle_agent.py episode_he.srt \
   --source-lang he \
   --targets en,ru \
-  --base-url http://192.168.1.50:8080/v1 \
-  --model qwen3.6-27b
+  --reference-file transcript_he.html \
+  --base-url http://192.168.1.50:8080/v1
 ```
 
-The corrected source is always written separately as `episode_he.corrected.he.srt`.
-
-### Czech source to English only
+Czech to English with a separate critic:
 
 ```bash
 python subtitle_agent.py episode_cs.srt \
   --source-lang cs \
   --targets en \
+  --model qwen3.6-27b \
+  --critic-model critic-model \
   --base-url http://192.168.1.50:8080/v1
 ```
 
-### Spanish source to Russian only
-
-```bash
-python subtitle_agent.py episode_es.srt \
-  --source-lang es \
-  --targets ru \
-  --base-url http://192.168.1.50:8080/v1
-```
-
-### Portuguese source with automatic detection
+General web reference with local fallback:
 
 ```bash
 python subtitle_agent.py episode_pt.srt \
-  --source-lang auto \
-  --targets en,ru \
-  --base-url http://192.168.1.50:8080/v1
-```
-
-Automatic detection uses script detection for Hebrew and Russian and lexical heuristics for English, Czech, Spanish, and Portuguese. When Latin-language evidence is ambiguous, the program stops and asks for an explicit `--source-lang` instead of guessing silently.
-
-## Reference transcripts and scripts
-
-Reference material is optional and may be supplied multiple times. All extracted text is combined and indexed locally; only the most relevant excerpts are sent with each subtitle batch.
-
-### General HTTP(S) page
-
-```bash
-python subtitle_agent.py episode.srt \
-  --source-lang es \
-  --reference-url 'https://example.org/transcript-page' \
-  --targets en,ru \
-  --base-url http://192.168.1.50:8080/v1
-```
-
-The URL reader:
-
-- follows normal HTTP redirects;
-- reads only the user-provided URL and does not crawl links;
-- parses static HTML into visible text;
-- accepts direct plain-text, PDF, and DOCX responses;
-- enforces `--reference-max-bytes`;
-- never executes JavaScript.
-
-Pages whose transcript is rendered only by JavaScript may yield little or no text. Save or export such a page as `.html` or `.txt` and use `--reference-file`.
-
-### Local TXT fallback
-
-```bash
-python subtitle_agent.py episode.srt \
-  --source-lang he \
-  --reference-file transcript.txt \
-  --targets en,ru \
-  --base-url http://192.168.1.50:8080/v1
-```
-
-### Local HTML fallback
-
-```bash
-python subtitle_agent.py episode.srt \
-  --source-lang cs \
-  --reference-file saved_transcript.html \
-  --targets en,ru \
-  --base-url http://192.168.1.50:8080/v1
-```
-
-### Mixed references
-
-```bash
-python subtitle_agent.py episode.srt \
   --source-lang pt \
   --reference-url 'https://example.org/published-script' \
-  --reference-file producer_corrections.txt \
-  --reference-file names_and_terms.html \
+  --reference-file backup-script.txt \
   --targets en,ru \
   --base-url http://192.168.1.50:8080/v1
 ```
-
-The older flexible form remains supported:
-
-```bash
---reference https://example.org/transcript
---reference transcript.txt
-```
-
-Supported local reference formats are `.txt`, `.html`, `.htm`, `.md`, `.docx`, and `.pdf`. Other text-like files are read as plain text.
-
-## Immutable media verification
-
-```bash
-python subtitle_agent.py episode.srt \
-  --source-lang es \
-  --audio /media/readonly/episode.wav \
-  --reference-file transcript.txt \
-  --targets en,ru \
-  --base-url http://192.168.1.50:8080/v1
-```
-
-The media file is fingerprinted before and after the run. Any size, timestamp, or SHA-256 change causes the command to fail.
 
 ## Outputs
 
-For `episode.srt` with a Spanish source and both targets:
+For `episode.srt` with a Spanish source:
 
 ```text
-episode.corrected.es.srt  # corrected Spanish source
-episode.en.srt            # English translation
-episode.ru.srt            # Russian translation
-episode.audit.json        # changes, review findings, references, checksums, settings
+episode.corrected.es.srt
+episode.en.srt
+episode.ru.srt
+episode.audit.json
 .subtitle_agent_cache.json
+diagnostics/RUN_ID/                 # only created after failed attempts
 ```
 
-When the source is already one of the requested targets, that target file contains the corrected source. For example, an English source with `--targets en,ru` produces corrected English as both `episode.corrected.en.srt` and `episode.en.srt`.
+When the source is already a requested target, that target file contains the corrected source.
 
-## Recommended tuning
+## Retry behavior
 
-Defaults use 48 cues per request, four neighboring cues on each side, and up to two critic/reviser rounds.
+`--retries` means retries of the same response constraint. It does not mean “weaken the output mode on every retry.”
 
-Faster run:
+The strict sequence is:
+
+```text
+schema request
+  -> same-mode retry for transient/repairable output failure
+  -> split affected batch when appropriate
+  -> repeat with schema
+  -> stop at minimum batch size if still invalid
+```
+
+The adaptive sequence adds generic JSON and plain-text extraction only at minimum batch size.
+
+## JSON repair
+
+The parser first attempts strict JSON. It may recover an otherwise structured response containing a raw newline, tab, or other control character inside a quoted string. Every such repair is recorded in the audit. Unsafe control bytes are removed before text reaches an SRT or audit issue field.
+
+Repair does not bypass stage validation: IDs, fields, types, cue coverage, and nonempty text are still checked.
+
+## Testing
 
 ```bash
-python subtitle_agent.py episode.srt \
-  --source-lang cs \
-  --targets en,ru \
-  --review-rounds 1 \
-  --batch-size 64 \
-  --base-url http://192.168.1.50:8080/v1
+python -m unittest -v test_subtitle_agent.py
 ```
 
-More conservative run:
+The included tests cover:
 
-```bash
-python subtitle_agent.py episode.srt \
-  --source-lang he \
-  --targets en,ru \
-  --review-rounds 3 \
-  --batch-size 32 \
-  --context-cues 6 \
-  --base-url http://192.168.1.50:8080/v1
-```
+- all supported source-language detection paths;
+- local and HTTP reference parsing;
+- tolerant JSON parsing;
+- strict critic validation;
+- classified batch splitting;
+- validated-only cache behavior;
+- strict versus adaptive fallback policy.
 
-The cache key includes prompts, model, schema, and generation settings. Re-running the same command resumes from successful calls. Use `--no-cache` for a clean run.
-
-## Important behavior
-
-- Cue count, original cue numbers, ordering, and timestamps are immutable.
-- The script does not merge or split cues automatically.
-- Reference text is evidence, not permission to replace subtitle content wholesale.
-- URL parsing is static; no browser engine or JavaScript runtime is used.
-- The model’s JSON is schema-constrained where supported and validated again by Python.
-- Human review remains recommended for reading speed, line breaks, names, and timing.
-
-## llama.cpp grammar-sampler compatibility
-
-If llama.cpp logs `error initializing grammar sampler` and shows an exact repetition such as `{47,47}`, use this version of the agent. It avoids putting the exact batch length into the JSON grammar and validates the complete cue-ID set in Python instead.
-
-For Qwen3.6, start a recent llama-server with reasoning disabled when possible:
-
-```bash
-llama-server -m Qwen3.6-27B-Q8_0.gguf -c 262144 --reasoning off --port 8080
-```
-
-The client also sends `reasoning_effort: "none"` and retains the older `enable_thinking: false` hint for compatibility. If schema-constrained JSON still fails, the agent automatically retries with generic JSON, then unconstrained output, while preserving Python-side structural validation. Keep `--retries 3` or higher for this fallback chain.
+Human review remains recommended for linguistic accuracy, line breaks, reading speed, names, and timing.

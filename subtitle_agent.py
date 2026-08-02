@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence, TypeVar
 
 
 TIMESTAMP_RE = re.compile(
@@ -52,6 +52,7 @@ HEBREW_RE = re.compile(r"[\u0590-\u05FF]")
 LATIN_RE = re.compile(r"[A-Za-z\u00C0-\u024F]")
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
+UNSAFE_CONTROL_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
 
 LANGUAGE_NAMES = {
     "en": "English",
@@ -104,6 +105,34 @@ class SubtitleAgentError(RuntimeError):
     pass
 
 
+class LLMStageError(SubtitleAgentError):
+    """A classified model-stage failure used by retry and batch-splitting logic."""
+
+    def __init__(
+        self,
+        stage: str,
+        kind: str,
+        message: str,
+        *,
+        retryable: bool = False,
+        response_mode: str | None = None,
+    ) -> None:
+        super().__init__(f"LLM stage {stage!r} failed [{kind}]: {message}")
+        self.stage = stage
+        self.kind = kind
+        self.retryable = retryable
+        self.response_mode = response_mode
+
+
+@dataclass(frozen=True)
+class ParseMetadata:
+    strict_json_failed: bool = False
+    lenient_json_used: bool = False
+    balanced_extraction_used: bool = False
+    think_block_removed: bool = False
+    markdown_fence_removed: bool = False
+
+
 @dataclass(frozen=True)
 class Cue:
     # id is a private, consecutive model-facing key. number is the original
@@ -127,6 +156,10 @@ class FileFingerprint:
 class AgentStats:
     llm_calls: int = 0
     cache_hits: int = 0
+    cache_evictions: int = 0
+    response_repairs: int = 0
+    batch_splits: int = 0
+    weak_fallbacks: int = 0
     correction_changes: int = 0
     correction_issues: int = 0
     translation_issues: dict[str, int] = dataclasses.field(default_factory=dict)
@@ -189,11 +222,24 @@ class JsonCache:
         if not self.path:
             return
         self.data[key] = value
+        self._flush()
+
+    def delete(self, key: str) -> None:
+        if key in self.data:
+            del self.data[key]
+            self._flush()
+
+    def _flush(self) -> None:
+        if not self.path:
+            return
         safe_atomic_write_text(
             self.path,
             json.dumps(self.data, ensure_ascii=False, indent=2),
             self.protected,
         )
+
+
+ValidatedT = TypeVar("ValidatedT")
 
 
 class LlamaCppClient:
@@ -206,6 +252,9 @@ class LlamaCppClient:
         cache: JsonCache,
         stats: AgentStats,
         disable_thinking: bool = True,
+        output_policy: str = "strict",
+        diagnostics_dir: Path | None = None,
+        protected: set[Path] | None = None,
     ) -> None:
         base = base_url.rstrip("/")
         if not base.endswith("/v1"):
@@ -217,6 +266,11 @@ class LlamaCppClient:
         self.cache = cache
         self.stats = stats
         self.disable_thinking = disable_thinking
+        self.output_policy = output_policy
+        self.diagnostics_dir = diagnostics_dir
+        self.protected = protected or set()
+        self.events: list[dict[str, Any]] = []
+        self._diagnostic_counter = 0
 
     def resolve_model(self) -> str:
         if self.model != "auto":
@@ -228,6 +282,41 @@ class LlamaCppClient:
         self.model = str(models[0]["id"])
         return self.model
 
+    def _record_event(self, **event: Any) -> None:
+        event.setdefault("at", datetime.now(timezone.utc).isoformat())
+        self.events.append(event)
+
+    def _write_diagnostic(
+        self,
+        *,
+        stage: str,
+        response_mode: str,
+        attempt: int,
+        error: Exception,
+        raw_content: str | None,
+    ) -> str | None:
+        if self.diagnostics_dir is None:
+            return None
+        self._diagnostic_counter += 1
+        safe_stage = re.sub(r"[^A-Za-z0-9_.-]+", "_", stage)[:120]
+        path = self.diagnostics_dir / (
+            f"{self._diagnostic_counter:05d}_{safe_stage}_{response_mode}_attempt{attempt}.json"
+        )
+        payload = {
+            "stage": stage,
+            "response_mode": response_mode,
+            "attempt": attempt,
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "raw_model_content": raw_content,
+        }
+        safe_atomic_write_text(
+            path,
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            self.protected,
+        )
+        return str(path)
+
     def complete_json(
         self,
         *,
@@ -237,7 +326,16 @@ class LlamaCppClient:
         max_tokens: int,
         temperature: float,
         stage: str,
-    ) -> dict[str, Any]:
+        validator: Callable[[Mapping[str, Any]], ValidatedT],
+        validator_name: str,
+        allow_weak_fallback: bool = False,
+    ) -> ValidatedT:
+        """Generate, parse, validate, and only then cache a model response.
+
+        Strict mode never weakens the response constraint. Adaptive mode may use
+        generic JSON or plain text only when the orchestration layer has already
+        reduced the failing batch to its configured minimum size.
+        """
         model = self.resolve_model()
         request_identity = {
             "base_url": self.base_url,
@@ -248,14 +346,32 @@ class LlamaCppClient:
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stage": stage,
+            "validator": validator_name,
+            "output_policy": self.output_policy,
+            "disable_thinking": self.disable_thinking,
+            "agent_cache_version": 3,
         }
         key = hashlib.sha256(
             json.dumps(request_identity, sort_keys=True, ensure_ascii=False).encode("utf-8")
         ).hexdigest()
+
         cached = self.cache.get(key)
         if isinstance(cached, dict):
-            self.stats.cache_hits += 1
-            return cached
+            try:
+                validated = validator(cached)
+            except Exception as exc:
+                self.cache.delete(key)
+                self.stats.cache_evictions += 1
+                self._record_event(
+                    stage=stage,
+                    outcome="cache_evicted",
+                    failure_kind="validation",
+                    error=str(exc),
+                )
+            else:
+                self.stats.cache_hits += 1
+                self._record_event(stage=stage, outcome="cache_hit", validator=validator_name)
+                return validated
 
         base_payload: dict[str, Any] = {
             "model": model,
@@ -268,61 +384,172 @@ class LlamaCppClient:
             "stream": False,
         }
         if self.disable_thinking:
-            # Current llama.cpp uses reasoning_effort=none as the per-request
-            # switch. Keep enable_thinking=false for older builds. Do not use
-            # reasoning_format=none here: it controls parsing, not reliably
-            # whether Qwen3.x enters a thinking block.
             base_payload["chat_template_kwargs"] = {"enable_thinking": False}
             base_payload["reasoning_effort"] = "none"
 
-        # Prefer schema-constrained JSON. If llama.cpp cannot initialize the
-        # generated grammar, retry with generic JSON and finally with no grammar.
-        # Python validation below still requires every expected cue ID exactly once.
-        formats: list[dict[str, Any] | None] = [
-            {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "subtitle_agent_result",
-                    "strict": True,
-                    "schema": schema,
-                },
-            },
-            {"type": "json_object"},
-            None,
-        ]
-        last_error: Exception | None = None
-        for attempt in range(self.retries):
-            response_format = formats[min(attempt, len(formats) - 1)]
-            payload = dict(base_payload)
-            if response_format is not None:
-                payload["response_format"] = response_format
-            if attempt:
-                payload["messages"] = [
-                    payload["messages"][0],
-                    {
-                        "role": "user",
-                        "content": user
-                        + "\n\nYour previous response could not be parsed. Return only a JSON object "
-                          "that exactly follows the requested structure; no markdown or commentary.",
-                    },
-                ]
-            try:
-                self.stats.llm_calls += 1
-                raw = http_post_json(
-                    f"{self.base_url}/chat/completions",
-                    payload,
-                    timeout=self.timeout,
-                )
-                content = extract_message_content(raw)
-                parsed = parse_json_object(content)
-                self.cache.put(key, parsed)
-                return parsed
-            except Exception as exc:  # retry malformed output and transient HTTP failures
-                last_error = exc
-                if attempt + 1 < self.retries:
-                    time.sleep(min(2 ** attempt, 5))
-        raise SubtitleAgentError(f"LLM stage {stage!r} failed: {last_error}")
+        modes = ["json_schema"]
+        if self.output_policy == "adaptive" and allow_weak_fallback:
+            modes.extend(["json_object", "text"])
 
+        last_error: LLMStageError | None = None
+        for mode_index, response_mode in enumerate(modes):
+            if mode_index:
+                self.stats.weak_fallbacks += 1
+                self._record_event(
+                    stage=stage,
+                    outcome="constraint_weakened",
+                    response_mode=response_mode,
+                )
+
+            for attempt in range(1, self.retries + 1):
+                payload = dict(base_payload)
+                if response_mode == "json_schema":
+                    payload["response_format"] = {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "subtitle_agent_result",
+                            "strict": True,
+                            "schema": schema,
+                        },
+                    }
+                elif response_mode == "json_object":
+                    payload["response_format"] = {"type": "json_object"}
+
+                if attempt > 1:
+                    payload["messages"] = [
+                        payload["messages"][0],
+                        {
+                            "role": "user",
+                            "content": user
+                            + "\n\nThe previous response failed machine validation. Return only one "
+                              "JSON object that exactly follows the requested structure. Do not use "
+                              "markdown or commentary, and escape all newlines inside JSON strings.",
+                        },
+                    ]
+
+                raw_content: str | None = None
+                try:
+                    self.stats.llm_calls += 1
+                    raw = http_post_json(
+                        f"{self.base_url}/chat/completions",
+                        payload,
+                        timeout=self.timeout,
+                    )
+                    raw_content, finish_reason = extract_message_content(raw)
+                    if finish_reason == "length":
+                        raise LLMStageError(
+                            stage,
+                            "truncated",
+                            "The server stopped generation because max_tokens was reached",
+                            retryable=True,
+                            response_mode=response_mode,
+                        )
+                    parsed, parse_meta = parse_json_object_with_metadata(raw_content)
+                    try:
+                        validated = validator(parsed)
+                    except Exception as exc:
+                        raise LLMStageError(
+                            stage,
+                            "validation",
+                            str(exc),
+                            retryable=True,
+                            response_mode=response_mode,
+                        ) from exc
+
+                    # Cache only a response that has passed stage-specific validation.
+                    self.cache.put(key, parsed)
+                    repaired = any(dataclasses.asdict(parse_meta).values())
+                    if repaired:
+                        self.stats.response_repairs += 1
+                    self._record_event(
+                        stage=stage,
+                        outcome="success",
+                        response_mode=response_mode,
+                        attempt=attempt,
+                        finish_reason=finish_reason,
+                        parser=dataclasses.asdict(parse_meta),
+                        validator=validator_name,
+                    )
+                    return validated
+                except Exception as exc:
+                    error = classify_stage_error(exc, stage, response_mode)
+                    last_error = error
+                    diagnostic = self._write_diagnostic(
+                        stage=stage,
+                        response_mode=response_mode,
+                        attempt=attempt,
+                        error=error,
+                        raw_content=raw_content,
+                    )
+                    self._record_event(
+                        stage=stage,
+                        outcome="failure",
+                        response_mode=response_mode,
+                        attempt=attempt,
+                        failure_kind=error.kind,
+                        retryable=error.retryable,
+                        error=str(error),
+                        diagnostic=diagnostic,
+                    )
+
+                    # Grammar/request-shape failures are deterministic for this
+                    # exact constrained request. Return control immediately so the
+                    # caller can split the batch rather than waste retries.
+                    if error.kind in {"grammar", "request_size", "request"}:
+                        break
+                    if not error.retryable:
+                        break
+                    if attempt < self.retries:
+                        time.sleep(min(2 ** (attempt - 1), 5))
+
+            # Strict policy ends here. Adaptive policy weakens constraints only
+            # for output/grammar failures at minimum batch size, never for network,
+            # authentication, or server-availability errors.
+            if (
+                self.output_policy != "adaptive"
+                or not allow_weak_fallback
+                or last_error is None
+                or last_error.kind not in SPLITTABLE_FAILURE_KINDS
+            ):
+                break
+
+        if last_error is None:
+            last_error = LLMStageError(stage, "unknown", "No model attempt was made")
+        raise last_error
+
+
+def classify_stage_error(
+    exc: Exception,
+    stage: str,
+    response_mode: str | None,
+) -> LLMStageError:
+    if isinstance(exc, LLMStageError):
+        return exc
+    text = str(exc)
+    lower = text.lower()
+    if "grammar" in lower or "failed to initialize samplers" in lower:
+        kind, retryable = "grammar", False
+    elif "http 413" in lower or "payload too large" in lower or "context size" in lower:
+        kind, retryable = "request_size", False
+    elif "timed out" in lower or "timeout" in lower or "could not reach" in lower:
+        kind, retryable = "network", True
+    elif re.search(r"http (429|5\d\d)", lower):
+        kind, retryable = "server_transient", True
+    elif re.search(r"http 4\d\d", lower):
+        kind, retryable = "request", False
+    elif "could not parse model json" in lower or "no json object" in lower or "unterminated json" in lower:
+        kind, retryable = "parse", True
+    elif "server returned invalid json" in lower or "unexpected chat-completions response" in lower:
+        kind, retryable = "server_response", True
+    else:
+        kind, retryable = "unknown", False
+    return LLMStageError(
+        stage,
+        kind,
+        text,
+        retryable=retryable,
+        response_mode=response_mode,
+    )
 
 def http_post_json(url: str, payload: Mapping[str, Any], timeout: int) -> dict[str, Any]:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -334,7 +561,7 @@ def http_post_json(url: str, payload: Mapping[str, Any], timeout: int) -> dict[s
             "Content-Type": "application/json",
             "Accept": "application/json",
             "Authorization": "Bearer no-key",
-            "User-Agent": "subtitle-agent/1.0",
+            "User-Agent": "subtitle-agent/5.0",
         },
     )
     try:
@@ -358,7 +585,7 @@ def http_get_json(url: str, timeout: int) -> dict[str, Any]:
     req = urllib.request.Request(
         url,
         method="GET",
-        headers={"Accept": "application/json", "User-Agent": "subtitle-agent/1.0"},
+        headers={"Accept": "application/json", "User-Agent": "subtitle-agent/5.0"},
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
@@ -371,37 +598,125 @@ def http_get_json(url: str, timeout: int) -> dict[str, Any]:
     return value
 
 
-def extract_message_content(payload: Mapping[str, Any]) -> str:
+def extract_message_content(payload: Mapping[str, Any]) -> tuple[str, str | None]:
     try:
-        content = payload["choices"][0]["message"]["content"]
+        choice = payload["choices"][0]
+        content = choice["message"]["content"]
+        finish_reason = choice.get("finish_reason")
     except (KeyError, IndexError, TypeError) as exc:
         raise SubtitleAgentError(f"Unexpected chat-completions response: {payload}") from exc
     if isinstance(content, str):
-        return content
+        return content, str(finish_reason) if finish_reason is not None else None
     if isinstance(content, list):
         chunks: list[str] = []
         for item in content:
             if isinstance(item, dict) and isinstance(item.get("text"), str):
                 chunks.append(item["text"])
         if chunks:
-            return "".join(chunks)
+            return "".join(chunks), str(finish_reason) if finish_reason is not None else None
     raise SubtitleAgentError("The model response did not contain textual content")
 
 
-def parse_json_object(text: str) -> dict[str, Any]:
-    cleaned = THINK_RE.sub("", text).strip()
-    cleaned = FENCE_RE.sub("", cleaned).strip()
+def _extract_balanced_json_object(text: str) -> str:
+    """Return the first balanced JSON object, ignoring braces inside strings."""
+    start = text.find("{")
+    if start < 0:
+        raise SubtitleAgentError(f"No JSON object found in model output: {text[:1000]!r}")
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+
+    raise SubtitleAgentError(f"Unterminated JSON object in model output: {text[:1000]!r}")
+
+
+def _loads_model_json(candidate: str) -> tuple[Any, bool]:
+    """Parse model JSON and report whether lenient decoding was required."""
     try:
-        value = json.loads(cleaned)
-    except json.JSONDecodeError:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start < 0 or end <= start:
-            raise SubtitleAgentError(f"No JSON object found in model output: {text[:1000]!r}")
-        value = json.loads(cleaned[start : end + 1])
+        return json.loads(candidate), False
+    except json.JSONDecodeError as strict_error:
+        try:
+            return json.loads(candidate, strict=False), True
+        except json.JSONDecodeError:
+            raise strict_error
+
+
+def parse_json_object_with_metadata(text: str) -> tuple[dict[str, Any], ParseMetadata]:
+    think_removed = bool(THINK_RE.search(text))
+    cleaned = THINK_RE.sub("", text).strip()
+    fence_removed = bool(re.match(r"^\s*```", cleaned) or re.search(r"```\s*$", cleaned))
+    cleaned = FENCE_RE.sub("", cleaned).strip()
+    errors: list[json.JSONDecodeError] = []
+
+    candidates: list[tuple[str, bool]] = [(cleaned, False)]
+    try:
+        balanced = _extract_balanced_json_object(cleaned)
+    except SubtitleAgentError:
+        balanced = None
+    if balanced is not None and balanced != cleaned:
+        candidates.append((balanced, True))
+
+    for candidate, balanced_used in candidates:
+        try:
+            value, lenient_used = _loads_model_json(candidate)
+            metadata = ParseMetadata(
+                strict_json_failed=lenient_used,
+                lenient_json_used=lenient_used,
+                balanced_extraction_used=balanced_used,
+                think_block_removed=think_removed,
+                markdown_fence_removed=fence_removed,
+            )
+            break
+        except json.JSONDecodeError as exc:
+            errors.append(exc)
+    else:
+        if errors:
+            last = errors[-1]
+            raise SubtitleAgentError(
+                "Could not parse model JSON even with control-character tolerance: "
+                f"{last}; output prefix={text[:1000]!r}"
+            ) from last
+        raise SubtitleAgentError(f"No JSON object found in model output: {text[:1000]!r}")
+
     if not isinstance(value, dict):
         raise SubtitleAgentError("The model output must be one JSON object")
+    return value, metadata
+
+
+def parse_json_object(text: str) -> dict[str, Any]:
+    value, _ = parse_json_object_with_metadata(text)
     return value
+
+def clean_model_text(value: Any, *, flatten: bool = False) -> str:
+    """Normalize model-produced text before it reaches an SRT or audit file."""
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    text = UNSAFE_CONTROL_RE.sub("", text)
+    if flatten:
+        text = re.sub(r"\s+", " ", text)
+    else:
+        # Tabs are legal after lenient JSON parsing but undesirable in subtitles.
+        text = text.replace("\t", " ")
+        text = "\n".join(line.rstrip() for line in text.split("\n"))
+    return text.strip()
 
 
 def normalize_timestamp(value: str) -> str:
@@ -630,7 +945,7 @@ def read_url_text(url: str, timeout: int, max_bytes: int) -> tuple[str, str, str
         url,
         method="GET",
         headers={
-            "User-Agent": "subtitle-agent/2.0",
+            "User-Agent": "subtitle-agent/5.0",
             "Accept": (
                 "text/html,application/xhtml+xml,text/plain,application/pdf,"
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document,*/*;q=0.2"
@@ -869,6 +1184,66 @@ def batched(values: Sequence[int], size: int) -> Iterator[list[int]]:
         yield list(values[start : start + size])
 
 
+SPLITTABLE_FAILURE_KINDS = {"grammar", "request_size", "truncated", "parse", "validation"}
+BatchResultT = TypeVar("BatchResultT")
+
+
+def run_with_batch_splitting(
+    group: list[int],
+    operation: Callable[[list[int]], BatchResultT],
+    *,
+    min_batch_size: int,
+    stats: AgentStats,
+    split_audit: list[dict[str, Any]],
+    stage_family: str,
+) -> list[tuple[list[int], BatchResultT]]:
+    """Run a stage and recursively split only failures likely caused by batch shape/size."""
+    try:
+        return [(group, operation(group))]
+    except LLMStageError as exc:
+        if exc.kind not in SPLITTABLE_FAILURE_KINDS or len(group) <= min_batch_size:
+            raise
+        midpoint = len(group) // 2
+        left = group[:midpoint]
+        right = group[midpoint:]
+        if not left or not right:
+            raise
+        stats.batch_splits += 1
+        split_audit.append(
+            {
+                "stage_family": stage_family,
+                "original_batch": [group[0], group[-1]],
+                "original_size": len(group),
+                "split_batches": [[left[0], left[-1]], [right[0], right[-1]]],
+                "failure_kind": exc.kind,
+                "error": str(exc),
+            }
+        )
+        print(
+            f"      splitting {stage_family} batch {group[0]}-{group[-1]} "
+            f"({len(group)} cues) after {exc.kind} failure",
+            file=sys.stderr,
+        )
+        return (
+            run_with_batch_splitting(
+                left,
+                operation,
+                min_batch_size=min_batch_size,
+                stats=stats,
+                split_audit=split_audit,
+                stage_family=stage_family,
+            )
+            + run_with_batch_splitting(
+                right,
+                operation,
+                min_batch_size=min_batch_size,
+                stats=stats,
+                split_audit=split_audit,
+                stage_family=stage_family,
+            )
+        )
+
+
 def batch_context(
     cues: Sequence[Cue],
     texts: Mapping[int, str],
@@ -936,18 +1311,29 @@ def issues_schema() -> dict[str, Any]:
 
 
 def parse_items(result: Mapping[str, Any], expected_ids: Sequence[int]) -> dict[int, str]:
+    if set(result) != {"items"}:
+        raise SubtitleAgentError(
+            f"Model items response must contain only 'items'; got keys={sorted(map(str, result.keys()))}"
+        )
     raw_items = result.get("items")
     if not isinstance(raw_items, list):
         raise SubtitleAgentError("Model response is missing an items array")
     parsed: dict[int, str] = {}
-    for item in raw_items:
+    for index, item in enumerate(raw_items):
         if not isinstance(item, dict):
-            continue
-        try:
-            cue_id = int(item["id"])
-            text = str(item["text"]).strip()
-        except (KeyError, TypeError, ValueError):
-            continue
+            raise SubtitleAgentError(f"items[{index}] is not an object")
+        if set(item) != {"id", "text"}:
+            raise SubtitleAgentError(
+                f"items[{index}] must contain exactly id and text; got {sorted(map(str, item.keys()))}"
+            )
+        cue_id = item["id"]
+        if type(cue_id) is not int:  # bool is intentionally rejected
+            raise SubtitleAgentError(f"items[{index}].id is not an integer")
+        if not isinstance(item["text"], str):
+            raise SubtitleAgentError(f"items[{index}].text is not a string")
+        text = clean_model_text(item["text"])
+        if not text:
+            raise SubtitleAgentError(f"items[{index}] returned empty text for cue {cue_id}")
         if cue_id in parsed:
             raise SubtitleAgentError(f"Model returned duplicate cue ID {cue_id}")
         parsed[cue_id] = text
@@ -957,37 +1343,68 @@ def parse_items(result: Mapping[str, Any], expected_ids: Sequence[int]) -> dict[
         raise SubtitleAgentError(
             f"Model returned wrong cue IDs; missing={sorted(expected-actual)}, extra={sorted(actual-expected)}"
         )
+    if len(raw_items) != len(expected_ids):
+        raise SubtitleAgentError(
+            f"Model returned {len(raw_items)} items; expected {len(expected_ids)}"
+        )
     return parsed
 
 
 def parse_issues(result: Mapping[str, Any], allowed_ids: set[int]) -> list[dict[str, Any]]:
+    if set(result) != {"issues"}:
+        raise SubtitleAgentError(
+            f"Model critic response must contain only 'issues'; got keys={sorted(map(str, result.keys()))}"
+        )
     raw_issues = result.get("issues")
     if not isinstance(raw_issues, list):
         raise SubtitleAgentError("Model response is missing an issues array")
     issues: list[dict[str, Any]] = []
-    for issue in raw_issues:
+    seen_ids: set[int] = set()
+    required = {"id", "severity", "problem", "suggested_text"}
+    for index, issue in enumerate(raw_issues):
         if not isinstance(issue, dict):
-            continue
-        try:
-            cue_id = int(issue["id"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if cue_id not in allowed_ids:
-            continue
-        suggested = str(issue.get("suggested_text", "")).strip()
-        problem = str(issue.get("problem", "")).strip()
-        severity = str(issue.get("severity", "warning")).strip().lower()
-        if suggested:
-            issues.append(
-                {
-                    "id": cue_id,
-                    "severity": severity if severity in {"error", "warning"} else "warning",
-                    "problem": problem,
-                    "suggested_text": suggested,
-                }
+            raise SubtitleAgentError(f"issues[{index}] is not an object")
+        if set(issue) != required:
+            raise SubtitleAgentError(
+                f"issues[{index}] must contain exactly {sorted(required)}; "
+                f"got {sorted(map(str, issue.keys()))}"
             )
-    return issues
+        cue_id = issue["id"]
+        if type(cue_id) is not int:
+            raise SubtitleAgentError(f"issues[{index}].id is not an integer")
+        if cue_id not in allowed_ids:
+            raise SubtitleAgentError(f"Critic returned unexpected cue ID {cue_id}")
+        if cue_id in seen_ids:
+            raise SubtitleAgentError(f"Critic returned duplicate issue for cue ID {cue_id}")
+        seen_ids.add(cue_id)
 
+        severity_value = issue["severity"]
+        if not isinstance(severity_value, str):
+            raise SubtitleAgentError(f"issues[{index}].severity is not a string")
+        severity = severity_value.strip().lower()
+        if severity not in {"error", "warning"}:
+            raise SubtitleAgentError(
+                f"issues[{index}].severity must be 'error' or 'warning'"
+            )
+        if not isinstance(issue["problem"], str):
+            raise SubtitleAgentError(f"issues[{index}].problem is not a string")
+        if not isinstance(issue["suggested_text"], str):
+            raise SubtitleAgentError(f"issues[{index}].suggested_text is not a string")
+        problem = clean_model_text(issue["problem"], flatten=True)
+        suggested = clean_model_text(issue["suggested_text"])
+        if not problem:
+            raise SubtitleAgentError(f"issues[{index}].problem is empty")
+        if not suggested:
+            raise SubtitleAgentError(f"issues[{index}].suggested_text is empty")
+        issues.append(
+            {
+                "id": cue_id,
+                "severity": severity,
+                "problem": problem,
+                "suggested_text": suggested,
+            }
+        )
+    return issues
 
 def correction_editor_prompt(
     source_lang: str,
@@ -1026,12 +1443,13 @@ def correction_critic_prompt(
     reference: str,
 ) -> tuple[str, str]:
     language = LANGUAGE_NAMES[source_lang]
-    system = f"""You are the independent critic for a {language} subtitle correction agent.
+    system = f"""You are the review critic for a {language} subtitle correction agent.
 Find only actionable errors. Check the current version against the original, neighboring context,
 and any supporting reference excerpt. Flag mistranscriptions left unfixed, unsupported rewrites,
 wrong names or terminology, lost meaning, accidental translation, and broken cross-cue continuity.
 Do not demand stylistic rewrites when the current text is already faithful.
-For each issue, provide a complete replacement text for that one cue. Return an empty issues array
+For each issue, provide a complete replacement text for that one cue. Keep problem to one short
+single-line sentence. JSON-escape any line breaks inside suggested_text. Return an empty issues array
 when no actionable error remains. Do not discuss timestamps or cue merging."""
     payload = {
         "task": "Critique current corrected cues.",
@@ -1118,11 +1536,12 @@ def translation_critic_prompt(
 ) -> tuple[str, str]:
     source_name = LANGUAGE_NAMES[source_lang]
     target_name = LANGUAGE_NAMES[target_lang]
-    system = f"""You are the independent critic for {source_name}-to-{target_name} subtitle translation.
+    system = f"""You are the review critic for {source_name}-to-{target_name} subtitle translation.
 Find only actionable errors: omissions, additions, wrong meaning, wrong names or numbers, untranslated
 ordinary source text, unnatural target-language grammar, inconsistent terminology, and broken
 cross-cue continuity. Respect subtitle brevity, but do not shorten away meaning.
-For each issue provide a complete replacement in {target_name}. Return an empty issues array when
+For each issue provide a complete replacement in {target_name}. Keep problem to one short single-line
+sentence and JSON-escape line breaks inside suggested_text. Return an empty issues array when
 no actionable error remains. Do not request cue merging or timestamp changes."""
     payload = {
         "task": "Critique the current translation.",
@@ -1159,10 +1578,12 @@ def retrieve_reference(
 def correct_source(
     *,
     client: LlamaCppClient,
+    critic_client: LlamaCppClient,
     cues: Sequence[Cue],
     source_lang: str,
     reference_index: ReferenceIndex | None,
     batch_size: int,
+    min_batch_size: int,
     context_cues: int,
     review_rounds: int,
     reference_paragraphs: int,
@@ -1175,77 +1596,129 @@ def correct_source(
     current = dict(original)
     ids = [cue.id for cue in cues]
     stage_audit: list[dict[str, Any]] = []
+    split_audit: list[dict[str, Any]] = audit.setdefault("batch_splits", [])
 
     print(f"[1/3] Correcting {len(cues)} {LANGUAGE_NAMES[source_lang]} cues...", file=sys.stderr)
-    for group in batched(ids, batch_size):
-        before, batch, after = batch_context(cues, current, group, context_cues)
-        reference = retrieve_reference(
-            reference_index, batch, reference_paragraphs, reference_chars
-        )
-        system, user = correction_editor_prompt(source_lang, before, batch, after, reference)
-        result = client.complete_json(
-            system=system,
-            user=user,
-            schema=items_schema(group),
-            max_tokens=max_tokens,
-            temperature=0.05,
-            stage=f"correction-editor:{group[0]}-{group[-1]}",
-        )
-        current.update(parse_items(result, group))
-
-    for round_number in range(1, review_rounds + 1):
-        round_issues = 0
-        for group in batched(ids, batch_size):
-            before, current_batch, after = batch_context(cues, current, group, context_cues)
-            original_batch = [{"id": cue_id, "text": original[cue_id]} for cue_id in group]
+    for initial_group in batched(ids, batch_size):
+        def edit_operation(group: list[int]) -> dict[int, str]:
+            before, batch, after = batch_context(cues, current, group, context_cues)
             reference = retrieve_reference(
-                reference_index, original_batch, reference_paragraphs, reference_chars
+                reference_index, batch, reference_paragraphs, reference_chars
             )
-            system, user = correction_critic_prompt(
-                source_lang,
-                original_batch,
-                current_batch,
-                before,
-                after,
-                reference,
-            )
-            critique = client.complete_json(
-                system=system,
-                user=user,
-                schema=issues_schema(),
-                max_tokens=max_tokens,
-                temperature=0.0,
-                stage=f"correction-critic-r{round_number}:{group[0]}-{group[-1]}",
-            )
-            issues = parse_issues(critique, set(group))
-            if not issues:
-                continue
-            round_issues += len(issues)
-            stats.correction_issues += len(issues)
-            system, user = revision_prompt(
-                LANGUAGE_NAMES[source_lang],
-                current_batch,
-                issues,
-                before,
-                after,
-                mode="correction",
-            )
-            revised = client.complete_json(
+            system, user = correction_editor_prompt(source_lang, before, batch, after, reference)
+            return client.complete_json(
                 system=system,
                 user=user,
                 schema=items_schema(group),
                 max_tokens=max_tokens,
-                temperature=0.0,
-                stage=f"correction-reviser-r{round_number}:{group[0]}-{group[-1]}",
+                temperature=0.05,
+                stage=f"correction-editor:{group[0]}-{group[-1]}",
+                validator=lambda payload, expected=tuple(group): parse_items(payload, expected),
+                validator_name="parse_items",
+                allow_weak_fallback=len(group) <= min_batch_size,
             )
-            current.update(parse_items(revised, group))
-            stage_audit.append(
-                {
-                    "round": round_number,
-                    "batch": [group[0], group[-1]],
-                    "issues": issues,
-                }
+
+        for _, edited in run_with_batch_splitting(
+            initial_group,
+            edit_operation,
+            min_batch_size=min_batch_size,
+            stats=stats,
+            split_audit=split_audit,
+            stage_family="correction-editor",
+        ):
+            current.update(edited)
+
+    for round_number in range(1, review_rounds + 1):
+        round_issues = 0
+        for initial_group in batched(ids, batch_size):
+            def critic_operation(group: list[int]) -> list[dict[str, Any]]:
+                before, current_batch, after = batch_context(cues, current, group, context_cues)
+                original_batch = [{"id": cue_id, "text": original[cue_id]} for cue_id in group]
+                reference = retrieve_reference(
+                    reference_index, original_batch, reference_paragraphs, reference_chars
+                )
+                system, user = correction_critic_prompt(
+                    source_lang,
+                    original_batch,
+                    current_batch,
+                    before,
+                    after,
+                    reference,
+                )
+                return critic_client.complete_json(
+                    system=system,
+                    user=user,
+                    schema=issues_schema(),
+                    max_tokens=max_tokens,
+                    temperature=0.0,
+                    stage=f"correction-critic-r{round_number}:{group[0]}-{group[-1]}",
+                    validator=lambda payload, allowed=set(group): parse_issues(payload, allowed),
+                    validator_name="parse_issues",
+                    allow_weak_fallback=len(group) <= min_batch_size,
+                )
+
+            reviewed_groups = run_with_batch_splitting(
+                initial_group,
+                critic_operation,
+                min_batch_size=min_batch_size,
+                stats=stats,
+                split_audit=split_audit,
+                stage_family=f"correction-critic-r{round_number}",
             )
+            for reviewed_group, issues in reviewed_groups:
+                if not issues:
+                    continue
+                round_issues += len(issues)
+                stats.correction_issues += len(issues)
+
+                def revise_operation(group: list[int]) -> dict[int, str]:
+                    group_issues = [issue for issue in issues if issue["id"] in set(group)]
+                    if not group_issues:
+                        return {cue_id: current[cue_id] for cue_id in group}
+                    before, current_batch, after = batch_context(
+                        cues, current, group, context_cues
+                    )
+                    system, user = revision_prompt(
+                        LANGUAGE_NAMES[source_lang],
+                        current_batch,
+                        group_issues,
+                        before,
+                        after,
+                        mode="correction",
+                    )
+                    return client.complete_json(
+                        system=system,
+                        user=user,
+                        schema=items_schema(group),
+                        max_tokens=max_tokens,
+                        temperature=0.0,
+                        stage=f"correction-reviser-r{round_number}:{group[0]}-{group[-1]}",
+                        validator=lambda payload, expected=tuple(group): parse_items(payload, expected),
+                        validator_name="parse_items",
+                        allow_weak_fallback=len(group) <= min_batch_size,
+                    )
+
+                revised_groups = run_with_batch_splitting(
+                    reviewed_group,
+                    revise_operation,
+                    min_batch_size=min_batch_size,
+                    stats=stats,
+                    split_audit=split_audit,
+                    stage_family=f"correction-reviser-r{round_number}",
+                )
+                for revised_group, revised in revised_groups:
+                    current.update(revised)
+                    relevant_issues = [
+                        issue for issue in issues if issue["id"] in set(revised_group)
+                    ]
+                    if relevant_issues:
+                        stage_audit.append(
+                            {
+                                "round": round_number,
+                                "batch": [revised_group[0], revised_group[-1]],
+                                "issues": relevant_issues,
+                            }
+                        )
         print(
             f"      correction review round {round_number}: {round_issues} issue(s)",
             file=sys.stderr,
@@ -1271,11 +1744,13 @@ def correct_source(
 def translate_target(
     *,
     client: LlamaCppClient,
+    critic_client: LlamaCppClient,
     cues: Sequence[Cue],
     source_texts: Mapping[int, str],
     source_lang: str,
     target_lang: str,
     batch_size: int,
+    min_batch_size: int,
     context_cues: int,
     review_rounds: int,
     max_tokens: int,
@@ -1287,82 +1762,136 @@ def translate_target(
 
     ids = [cue.id for cue in cues]
     target: dict[int, str] = {cue.id: "" for cue in cues}
+    split_audit: list[dict[str, Any]] = audit.setdefault("batch_splits", [])
     print(
         f"[2/3] Translating {LANGUAGE_NAMES[source_lang]} -> {LANGUAGE_NAMES[target_lang]}...",
         file=sys.stderr,
     )
-    for group in batched(ids, batch_size):
-        before_source, source_batch, after_source = batch_context(
-            cues, source_texts, group, context_cues
-        )
-        system, user = translation_editor_prompt(
-            source_lang, target_lang, before_source, source_batch, after_source
-        )
-        result = client.complete_json(
-            system=system,
-            user=user,
-            schema=items_schema(group),
-            max_tokens=max_tokens,
-            temperature=0.1,
-            stage=f"translation-{target_lang}-editor:{group[0]}-{group[-1]}",
-        )
-        target.update(parse_items(result, group))
+    for initial_group in batched(ids, batch_size):
+        def translate_operation(group: list[int]) -> dict[int, str]:
+            before_source, source_batch, after_source = batch_context(
+                cues, source_texts, group, context_cues
+            )
+            system, user = translation_editor_prompt(
+                source_lang, target_lang, before_source, source_batch, after_source
+            )
+            return client.complete_json(
+                system=system,
+                user=user,
+                schema=items_schema(group),
+                max_tokens=max_tokens,
+                temperature=0.1,
+                stage=f"translation-{target_lang}-editor:{group[0]}-{group[-1]}",
+                validator=lambda payload, expected=tuple(group): parse_items(payload, expected),
+                validator_name="parse_items",
+                allow_weak_fallback=len(group) <= min_batch_size,
+            )
+
+        for _, translated in run_with_batch_splitting(
+            initial_group,
+            translate_operation,
+            min_batch_size=min_batch_size,
+            stats=stats,
+            split_audit=split_audit,
+            stage_family=f"translation-{target_lang}-editor",
+        ):
+            target.update(translated)
 
     target_audit: list[dict[str, Any]] = []
     total_issues = 0
     for round_number in range(1, review_rounds + 1):
         round_issues = 0
-        for group in batched(ids, batch_size):
-            _, source_batch, _ = batch_context(cues, source_texts, group, context_cues)
-            before_target, target_batch, after_target = batch_context(
-                cues, target, group, context_cues
+        for initial_group in batched(ids, batch_size):
+            def critic_operation(group: list[int]) -> list[dict[str, Any]]:
+                _, source_batch, _ = batch_context(cues, source_texts, group, context_cues)
+                before_target, target_batch, after_target = batch_context(
+                    cues, target, group, context_cues
+                )
+                system, user = translation_critic_prompt(
+                    source_lang,
+                    target_lang,
+                    source_batch,
+                    target_batch,
+                    before_target,
+                    after_target,
+                )
+                return critic_client.complete_json(
+                    system=system,
+                    user=user,
+                    schema=issues_schema(),
+                    max_tokens=max_tokens,
+                    temperature=0.0,
+                    stage=f"translation-{target_lang}-critic-r{round_number}:{group[0]}-{group[-1]}",
+                    validator=lambda payload, allowed=set(group): parse_issues(payload, allowed),
+                    validator_name="parse_issues",
+                    allow_weak_fallback=len(group) <= min_batch_size,
+                )
+
+            reviewed_groups = run_with_batch_splitting(
+                initial_group,
+                critic_operation,
+                min_batch_size=min_batch_size,
+                stats=stats,
+                split_audit=split_audit,
+                stage_family=f"translation-{target_lang}-critic-r{round_number}",
             )
-            system, user = translation_critic_prompt(
-                source_lang,
-                target_lang,
-                source_batch,
-                target_batch,
-                before_target,
-                after_target,
-            )
-            critique = client.complete_json(
-                system=system,
-                user=user,
-                schema=issues_schema(),
-                max_tokens=max_tokens,
-                temperature=0.0,
-                stage=f"translation-{target_lang}-critic-r{round_number}:{group[0]}-{group[-1]}",
-            )
-            issues = parse_issues(critique, set(group))
-            if not issues:
-                continue
-            round_issues += len(issues)
-            total_issues += len(issues)
-            system, user = revision_prompt(
-                LANGUAGE_NAMES[target_lang],
-                target_batch,
-                issues,
-                before_target,
-                after_target,
-                mode="translation",
-                source=source_batch,
-            )
-            revised = client.complete_json(
-                system=system,
-                user=user,
-                schema=items_schema(group),
-                max_tokens=max_tokens,
-                temperature=0.0,
-                stage=f"translation-{target_lang}-reviser-r{round_number}:{group[0]}-{group[-1]}",
-            )
-            target.update(parse_items(revised, group))
-            target_audit.append(
-                {
-                    "round": round_number,
-                    "batch": [group[0], group[-1]],
-                    "issues": issues,
-                }
-            )
+            for reviewed_group, issues in reviewed_groups:
+                if not issues:
+                    continue
+                round_issues += len(issues)
+                total_issues += len(issues)
+
+                def revise_operation(group: list[int]) -> dict[int, str]:
+                    group_set = set(group)
+                    group_issues = [issue for issue in issues if issue["id"] in group_set]
+                    if not group_issues:
+                        return {cue_id: target[cue_id] for cue_id in group}
+                    _, source_batch, _ = batch_context(cues, source_texts, group, context_cues)
+                    before_target, target_batch, after_target = batch_context(
+                        cues, target, group, context_cues
+                    )
+                    system, user = revision_prompt(
+                        LANGUAGE_NAMES[target_lang],
+                        target_batch,
+                        group_issues,
+                        before_target,
+                        after_target,
+                        mode="translation",
+                        source=source_batch,
+                    )
+                    return client.complete_json(
+                        system=system,
+                        user=user,
+                        schema=items_schema(group),
+                        max_tokens=max_tokens,
+                        temperature=0.0,
+                        stage=f"translation-{target_lang}-reviser-r{round_number}:{group[0]}-{group[-1]}",
+                        validator=lambda payload, expected=tuple(group): parse_items(payload, expected),
+                        validator_name="parse_items",
+                        allow_weak_fallback=len(group) <= min_batch_size,
+                    )
+
+                revised_groups = run_with_batch_splitting(
+                    reviewed_group,
+                    revise_operation,
+                    min_batch_size=min_batch_size,
+                    stats=stats,
+                    split_audit=split_audit,
+                    stage_family=f"translation-{target_lang}-reviser-r{round_number}",
+                )
+                for revised_group, revised in revised_groups:
+                    target.update(revised)
+                    relevant_issues = [
+                        issue for issue in issues if issue["id"] in set(revised_group)
+                    ]
+                    if relevant_issues:
+                        target_audit.append(
+                            {
+                                "round": round_number,
+                                "batch": [revised_group[0], revised_group[-1]],
+                                "issues": relevant_issues,
+                            }
+                        )
         print(
             f"      {target_lang} review round {round_number}: {round_issues} issue(s)",
             file=sys.stderr,
@@ -1375,7 +1904,6 @@ def translate_target(
         "review_batches": target_audit,
     }
     return target
-
 
 def normalize_compare(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
@@ -1491,7 +2019,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Model ID/alias; auto uses the first /v1/models entry",
     )
-    parser.add_argument("--batch-size", type=int, default=48, help="Cues per model batch")
+    parser.add_argument("--batch-size", type=int, default=48, help="Initial cues per model batch")
+    parser.add_argument(
+        "--min-batch-size",
+        type=int,
+        default=4,
+        help="Smallest batch used by automatic fail-closed splitting",
+    )
     parser.add_argument("--context-cues", type=int, default=4, help="Neighboring cues per side")
     parser.add_argument(
         "--review-rounds", type=int, default=2, help="Maximum critic/reviser rounds per stage"
@@ -1503,7 +2037,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-line-chars", type=int, default=44, help="Soft output wrapping width; 0 disables"
     )
     parser.add_argument("--timeout", type=int, default=900, help="HTTP timeout per LLM call, seconds")
-    parser.add_argument("--retries", type=int, default=3, help="LLM request/JSON retries")
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=3,
+        help="Retries of the same response constraint before a classified failure",
+    )
+    parser.add_argument(
+        "--output-policy",
+        choices=["strict", "adaptive"],
+        default="strict",
+        help=(
+            "strict never weakens schema constraints; adaptive permits generic JSON/plain-text "
+            "fallback only after a failing batch reaches --min-batch-size"
+        ),
+    )
+    parser.add_argument(
+        "--critic-model",
+        help="Optional separate llama.cpp model ID/alias for critic stages",
+    )
+    parser.add_argument(
+        "--diagnostics-dir",
+        type=Path,
+        help="Base directory for failed raw model responses (default: OUTPUT_DIR/diagnostics)",
+    )
+    parser.add_argument(
+        "--no-diagnostics",
+        action="store_true",
+        help="Do not preserve failed raw model responses",
+    )
     parser.add_argument(
         "--reference-max-bytes", type=int, default=20_000_000, help="Maximum downloaded reference size"
     )
@@ -1528,16 +2090,31 @@ def build_parser() -> argparse.ArgumentParser:
 def check_arguments(args: argparse.Namespace) -> None:
     if args.batch_size < 1:
         raise SubtitleAgentError("--batch-size must be positive")
+    if args.min_batch_size < 1:
+        raise SubtitleAgentError("--min-batch-size must be positive")
+    if args.min_batch_size > args.batch_size:
+        raise SubtitleAgentError("--min-batch-size cannot exceed --batch-size")
     if args.context_cues < 0:
         raise SubtitleAgentError("--context-cues cannot be negative")
     if args.review_rounds < 0:
         raise SubtitleAgentError("--review-rounds cannot be negative")
     if args.max_tokens < 256:
         raise SubtitleAgentError("--max-tokens is too small")
+    if args.retries < 1:
+        raise SubtitleAgentError("--retries must be at least 1")
+    if args.timeout < 1:
+        raise SubtitleAgentError("--timeout must be positive")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    output_dir: Path | None = None
+    input_srt: Path | None = None
+    protected: set[Path] = set()
+    audit: dict[str, Any] | None = None
+    client: LlamaCppClient | None = None
+    critic_client: LlamaCppClient | None = None
+    stats: AgentStats | None = None
     try:
         check_arguments(args)
         input_srt = args.input_srt.expanduser().resolve()
@@ -1545,7 +2122,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise SubtitleAgentError(f"Input SRT does not exist: {input_srt}")
         output_dir = args.output_dir.expanduser().resolve()
 
-        protected: set[Path] = {input_srt}
+        protected = {input_srt}
         audio_before: FileFingerprint | None = None
         audio_path: Path | None = None
         if args.audio:
@@ -1596,6 +2173,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         targets: list[str] = args.targets
 
         output_dir.mkdir(parents=True, exist_ok=True)
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        diagnostics_dir: Path | None = None
+        if not args.no_diagnostics:
+            diagnostics_base = (
+                args.diagnostics_dir.expanduser().resolve()
+                if args.diagnostics_dir
+                else output_dir / "diagnostics"
+            )
+            diagnostics_dir = diagnostics_base / run_id
+
         cache_path = None if args.no_cache else output_dir / ".subtitle_agent_cache.json"
         cache = JsonCache(cache_path, protected)
         stats = AgentStats()
@@ -1607,11 +2194,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             cache=cache,
             stats=stats,
             disable_thinking=not args.keep_thinking,
+            output_policy=args.output_policy,
+            diagnostics_dir=diagnostics_dir,
+            protected=protected,
         )
         model = client.resolve_model()
 
-        audit: dict[str, Any] = {
-            "agent_version": "2.0",
+        if args.critic_model and args.critic_model != model:
+            critic_client = LlamaCppClient(
+                base_url=args.base_url,
+                model=args.critic_model,
+                timeout=args.timeout,
+                retries=args.retries,
+                cache=cache,
+                stats=stats,
+                disable_thinking=not args.keep_thinking,
+                output_policy=args.output_policy,
+                diagnostics_dir=diagnostics_dir,
+                protected=protected,
+            )
+            critic_model = critic_client.resolve_model()
+        else:
+            critic_client = client
+            critic_model = model
+
+        audit = {
+            "agent_version": "5.0",
+            "run_id": run_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "input_srt": str(input_srt),
             "input_sha256": sha256_file(input_srt),
@@ -1620,9 +2229,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "targets": targets,
             "reference_sources": reference_sources,
             "model": model,
+            "critic_model": critic_model,
             "base_url": args.base_url,
+            "diagnostics_dir": str(diagnostics_dir) if diagnostics_dir else None,
             "configuration": {
                 "batch_size": args.batch_size,
+                "min_batch_size": args.min_batch_size,
+                "output_policy": args.output_policy,
                 "context_cues": args.context_cues,
                 "review_rounds": args.review_rounds,
                 "max_tokens": args.max_tokens,
@@ -1645,10 +2258,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         corrected = correct_source(
             client=client,
+            critic_client=critic_client,
             cues=cues,
             source_lang=source_lang,
             reference_index=reference_index,
             batch_size=args.batch_size,
+            min_batch_size=args.min_batch_size,
             context_cues=args.context_cues,
             review_rounds=args.review_rounds,
             reference_paragraphs=args.reference_paragraphs,
@@ -1662,11 +2277,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         for target_lang in targets:
             outputs[target_lang] = translate_target(
                 client=client,
+                critic_client=critic_client,
                 cues=cues,
                 source_texts=corrected,
                 source_lang=source_lang,
                 target_lang=target_lang,
                 batch_size=args.batch_size,
+                min_batch_size=args.min_batch_size,
                 context_cues=args.context_cues,
                 review_rounds=args.review_rounds,
                 max_tokens=args.max_tokens,
@@ -1705,9 +2322,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             audio_after = verify_unchanged(audio_before, audio_path)
             print("Protected audio checksum is unchanged.", file=sys.stderr)
 
+        audit["status"] = "success"
         audit["audio_after"] = dataclasses.asdict(audio_after) if audio_after else None
         audit["generated_files"] = generated_files
         audit["warnings"] = warnings
+        audit["llm_events"] = [
+            {"client": "primary", **event} for event in client.events
+        ]
+        if critic_client is not client:
+            audit["llm_events"].extend(
+                {"client": "critic", **event} for event in critic_client.events
+            )
         audit["statistics"] = dataclasses.asdict(stats)
         audit_path = output_dir / f"{stem}.audit.json"
         safe_atomic_write_text(
@@ -1721,6 +2346,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     except (SubtitleAgentError, OSError, ValueError, zipfile.BadZipFile) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
+        if audit is not None and output_dir is not None and input_srt is not None:
+            try:
+                audit["status"] = "failed"
+                audit["failure"] = {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "at": datetime.now(timezone.utc).isoformat(),
+                }
+                events: list[dict[str, Any]] = []
+                if client is not None:
+                    events.extend({"client": "primary", **event} for event in client.events)
+                if critic_client is not None and critic_client is not client:
+                    events.extend({"client": "critic", **event} for event in critic_client.events)
+                audit["llm_events"] = events
+                if stats is not None:
+                    audit["statistics"] = dataclasses.asdict(stats)
+                output_dir.mkdir(parents=True, exist_ok=True)
+                run_suffix = str(audit.get("run_id", "failed-run"))
+                failure_path = output_dir / f"{input_srt.stem}.{run_suffix}.failure.audit.json"
+                safe_atomic_write_text(
+                    failure_path,
+                    json.dumps(audit, ensure_ascii=False, indent=2),
+                    protected,
+                )
+                print(f"Failure audit: {failure_path}", file=sys.stderr)
+            except Exception as audit_exc:
+                print(f"WARNING: could not write failure audit: {audit_exc}", file=sys.stderr)
         return 2
 
 
