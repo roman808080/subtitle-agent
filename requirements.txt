@@ -1,0 +1,3 @@
+# The subtitle agent itself uses only Python's standard library.
+# Install this optional dependency only for local or remote PDF reference scripts:
+pypdf>=5.0
